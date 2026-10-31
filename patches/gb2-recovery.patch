@@ -1,0 +1,762 @@
+--- a/gb2-update.c
++++ b/gb2-update.c
+@@ -8,6 +8,12 @@
+  */
+ 
+ /* the hard analyzing work was done by Karsten - Thx */
++/* Publication copy: fixed SYNTHETIC target UID47000001; replace before real use.
++ * Isolated recovery fork: already-active type0010 bootloader.
++ * Default: offline preflight. --execute --bootloader -i is required for CAN.
++ * No reset, startup magic, automatic retry or application-start frame. */
++#define _DEFAULT_SOURCE
++#define _POSIX_C_SOURCE 200809L
+ 
+ #include <ctype.h>
+ #include <stdio.h>
+@@ -18,6 +24,8 @@
+ #include <signal.h>
+ #include <errno.h>
+ #include <time.h>
++#include <getopt.h>
++#include <stdint.h>
+ 
+ #include <sys/time.h>
+ #include <sys/types.h>
+@@ -29,6 +37,8 @@
+ #include <arpa/inet.h>
+ 
+ #include <linux/can.h>
++#include <linux/can/raw.h>
++#include <linux/can/error.h>
+ 
+ #define MAXDG   4096		/* maximum datagram size */
+ #define MAXUDP  16		/* maximum datagram size */
+@@ -111,12 +121,18 @@
+ 
+ #define MS2_UPDATE_DATA_SIZE ((sizeof(ms2_update_data) / sizeof(struct updatefile)) - 1)
+ 
+-extern uint16_t CRCCCITT(uint8_t * data, size_t length, uint16_t seed);
++uint16_t CRCCCITT(uint8_t *data, size_t length, uint16_t seed) {
++    uint32_t crc = seed;
++    for (size_t i = 0; i < length; ++i) {
++        crc ^= (uint32_t)data[i] << 8;
++        for (unsigned bit = 0; bit < 8; ++bit)
++            crc = ((crc << 1) ^ ((crc & 0x8000U) ? 0x1021U : 0U)) & 0xffffU;
++    }
++    return (uint16_t)crc;
++}
+ 
+ unsigned char netframe[MAXDG];
+ 
+-static char *CECK_FORMAT_STRG   = "  CHEKCAN    CANID 0x%08X   [%d]";
+-
+ unsigned char M_GLEISBOX_MAGIC_START_SEQUENCE[]	= { 0x00, 0x36, 0x03, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00 };
+ unsigned char M_CAN_PING[] 			= { 0x00, 0x30, 0x47, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+ unsigned char M_RESET[] 			= { 0x00, 0x00, 0x47, 0x11, 0x06, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0x00, 0x00 };
+@@ -144,18 +160,31 @@
+ int dev_bin_blocks;
+ int last_bin_block;
+ int finished;
++enum recovery_phase { REC_IDLE, REC_WAIT_BOOT, REC_WAIT_SELECT, REC_SENDING, REC_WAIT_CRC, REC_DONE, REC_ABORT };
++static enum recovery_phase recovery_state;
++static const uint8_t recovery_uid[4] = {0x47, 0x00, 0x00, 0x01};
++static int execute_recovery, bootloader_only, have_boot_hash;
++static uint16_t boot_hash, block_crc;
++static uint64_t phase_deadline;
++static unsigned sent_parts, acknowledged_blocks;
++static volatile sig_atomic_t interrupted;
++static FILE *recovery_log;
++/* Independent Python binascii.crc_hqx over each FF-padded 512-byte block.
++ * Detects accidental input corruption; full SHA256 is documented separately. */
++static const uint16_t expected_crcs[53] = {
++    0x6b94U,0x553aU,0x22b4U,0x5961U,0x3fdcU,0xb716U,0x01e6U,0xc8b0U,0xad98U,
++    0xcf12U,0xda68U,0x2c89U,0x01dbU,0xc484U,0xd89aU,0xa96bU,0x10b5U,0xeabaU,
++    0xe41fU,0x8ac3U,0xefdbU,0xba79U,0x07f1U,0x54a3U,0xa247U,0xb7d7U,0x7784U,
++    0x54ebU,0xd33dU,0x1701U,0x16c1U,0x35aaU,0xd021U,0x1db0U,0x0ccfU,0xaa88U,
++    0xd08bU,0xc7c9U,0x6651U,0xe9bdU,0x1a8aU,0xfb2bU,0x39cfU,0xb671U,0x990fU,
++    0x8875U,0x8e27U,0xebabU,0x2dd3U,0xc147U,0x0970U,0x6a89U,0xab54U
++};
+ 
+ void print_usage(char *prg) {
+-    fprintf(stderr, "\nUsage: %s -l <port> -d <port> -b <broacast_addr> -i <can interface> <update file>\n", prg);
+-    fprintf(stderr, "   Version 0.5\n");
+-    fprintf(stderr, "\n");
+-    fprintf(stderr, "         -d <port>           destination UDP port - default 15731\n");
+-    fprintf(stderr, "         -l <port>           listening UDP port   - default 15730\n");
+-    fprintf(stderr, "         -b <broacast_addr>  broadcast address - default 255.255.255.255\n");
+-    fprintf(stderr, "         -i <can int>        switch to can using interface <can int>\n");
+-    fprintf(stderr, "         -p                  print file information an exit\n");
+-    fprintf(stderr, "         -f                  force update even if device has already the same version\n");
+-    fprintf(stderr, "         -v                  verbose output\n\n");
++    fprintf(stderr,"Usage: %s [-i can0] [--bootloader] [--execute] [016-gb2.bin]\n",prg);
++    fprintf(stderr,"Fixed recovery target UID47000001; type0010 bootloader, type0011 application.\n");
++    fprintf(stderr,"Default: validate the pinned file and print the plan; ZERO sockets/writes.\n");
++    fprintf(stderr,"--execute REQUIRES --bootloader and -i; one query, no reset/start/retries.\n");
+ }
+ 
+ uint16_t be16(uint8_t *u) {
+@@ -167,8 +196,58 @@
+ }
+ 
+ uint32_t be32(uint8_t *u) {
+-    return (u[0] << 24) | (u[1] << 16) | (u[2] << 8) | u[3];
++    return ((uint32_t)u[0] << 24) | ((uint32_t)u[1] << 16) | ((uint32_t)u[2] << 8) | u[3];
++}
++
++static const char *phase_name(void) {
++    static const char *names[] = {"IDLE","WAIT_BOOT","WAIT_SELECT","SENDING","WAIT_CRC","DONE","ABORT"};
++    return names[recovery_state];
++}
++static uint64_t recovery_now(void) {
++    struct timespec t;
++    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0 || t.tv_sec < 0 ||
++        (uint64_t)t.tv_sec > UINT64_MAX / 1000U - 1U) return UINT64_MAX;
++    return (uint64_t)t.tv_sec * 1000U + (uint64_t)t.tv_nsec / 1000000U;
++}
++static int recovery_fail(const char *reason, const unsigned char *frame) {
++    FILE *log = recovery_log ? recovery_log : stderr;
++    fprintf(log,"RECOVERY ABORT: %s state=%s block=0x%02X file_index=%d offset=0x%04X parts=%u/64 crc=%04X acknowledged=%u/53\n",
++        reason,phase_name(),last_bin_block+2,last_bin_block,last_bin_block < 0 ? 0U : (unsigned)last_bin_block*512U,
++        sent_parts,(unsigned)block_crc,acknowledged_blocks);
++    if (frame) {
++        uint32_t id = ((uint32_t)frame[0]<<24)|((uint32_t)frame[1]<<16)|((uint32_t)frame[2]<<8)|frame[3];
++        fprintf(log,"RX %08X#",id);
++        for (unsigned i=0;i<frame[4] && i<8U;++i) fprintf(log,"%02X",frame[5+i]);
++        fprintf(log," dlc=%u wire=",(unsigned)frame[4]);
++        for (unsigned i=0;i<13U;++i) fprintf(log,"%02X",frame[i]);
++        fputc('\n',log);
++    }
++    fflush(log); recovery_state=REC_ABORT; finished=-1; return -1;
++}
++static int set_deadline(void) {
++    uint64_t now = recovery_now();
++    if (now > UINT64_MAX-5000U) return recovery_fail("clock unavailable/overflow",NULL);
++    phase_deadline=now+5000U; return 0;
++}
++static int check_deadline(void) {
++    if (recovery_state==REC_IDLE || recovery_state==REC_DONE || recovery_state==REC_ABORT) return 0;
++    if (interrupted) return recovery_fail("interrupted; no retry",NULL);
++    if (recovery_now()>=phase_deadline) return recovery_fail("absolute phase timeout; no retry",NULL);
++    return 0;
++}
++static int recovery_tx_allowed(unsigned char *f) {
++    uint32_t id=be32(f);
++    if (!execute_recovery || interrupted || f[4]>8U) return 0;
++    if (id==0x00364711U) {
++        if (f[4]==0U) return recovery_state==REC_WAIT_BOOT;
++        if (memcmp(f+5,recovery_uid,4)!=0) return 0;
++        if (f[4]==6U && f[9]==0x44U && recovery_state==REC_WAIT_SELECT)
++            return last_bin_block>=0 && last_bin_block<=52 && f[10]==last_bin_block+2;
++        return f[4]==7U && f[9]==0x88U && recovery_state==REC_SENDING && sent_parts==64U && be16(f+10)==block_crc;
++    }
++    return recovery_state==REC_SENDING && sent_parts<64U && f[4]==8U && id==0x00360300U+sent_parts;
+ }
++static void recovery_interrupt(int signal_number) { (void)signal_number; interrupted=1; }
+ 
+ int time_stamp(char *timestamp) {
+     struct timeval tv;
+@@ -217,6 +296,7 @@
+ void format_can_to_netframe(struct can_frame *frame, unsigned char *netframe) {
+     uint32_t canid;
+ 
++    memset(netframe,0,13);
+     frame->can_id &= CAN_EFF_MASK;
+     canid = htonl(frame->can_id);
+     memcpy(netframe, &canid, 4);
+@@ -236,6 +316,7 @@
+     struct can_frame frame;
+     struct timespec to_wait;
+ 
++    if (!recovery_tx_allowed(netframe)) return recovery_fail("TX gate refused frame",netframe);
+     memset(&frame, 0, sizeof(frame));
+     frame.can_id = be32(netframe);
+     frame.can_id &= CAN_EFF_MASK;
+@@ -248,20 +329,30 @@
+ 	fprintf(stderr, "%s: error writing CAN frame: %s\n", __func__, strerror(errno));
+ 	return -1;
+     }
+-    /* TODO : it seems Gleisbox needs a short break after every CAN message -> 20ms */
++    /* Preserve Gerd's conservative Gleisbox pacing: 20ms AFTER every write. */
+     to_wait.tv_sec = 0;
+     to_wait.tv_nsec = 20 * 1000000;
+-    nanosleep(&to_wait, NULL);
++    while (nanosleep(&to_wait, &to_wait) != 0) {
++        if (errno!=EINTR || interrupted) return -1;
++    }
++    if (interrupted) return -1;
+     return 0;
+ }
+ 
+ int send_frame(unsigned char *netframe) {
+-    int ret;
+-    if (can_mode)
+-	ret = netframe_to_can(sc, netframe);
+-    else
+-	ret = netframe_to_net(sb, netframe, 13);
+-    return ret;
++    if (!can_mode || !execute_recovery) return recovery_fail("recovery is not armed for SocketCAN",netframe);
++    if (netframe_to_can(sc,netframe)!=0)
++        return recovery_state==REC_ABORT ? -1 : recovery_fail("CAN write/pacing failed; no retry",netframe);
++    return 0;
++}
++
++static int begin_bootloader_recovery(void) {
++    if (!execute_recovery || !bootloader_only || recovery_state!=REC_IDLE)
++        return recovery_fail("explicit bootloader recovery required; one session only",NULL);
++    memcpy(&device_id,recovery_uid,4); last_bin_block=dev_bin_blocks;
++    recovery_state=REC_WAIT_BOOT;
++    if (set_deadline()!=0) return -1;
++    return send_frame(M_INIT_BOOTLOADER);
+ }
+ 
+ unsigned char *read_data(struct update_config *device_config) {
+@@ -277,6 +368,9 @@
+     fseek(fp, 0, SEEK_END);
+     fsize = ftell(fp);
+     fseek(fp, 0, SEEK_SET);
++    if (fsize!=27063U || device_config->id!=GB2_ID || device_config->block_size!=512U || device_config->boot_blocks!=2U) {
++        fprintf(stderr,"Only the pinned 27063-byte 016-gb2.bin/GB2 profile is supported\n"); fclose(fp); return NULL;
++    }
+     /* prepare padding */
+     device_fsize = (fsize + device_config->padding) & (0xFFFFFFFFUL - device_config->padding);
+ 
+@@ -287,7 +381,7 @@
+     }
+ 
+     /* padding with 0xff */
+-    memset(&data[device_fsize - device_config->padding], 0xff, device_config->padding);
++    memset(data,0xff,device_fsize);
+     if ((fread((void *)data, 1, fsize, fp)) != (unsigned int)fsize) {
+ 	fprintf(stderr, "%s: error: fread failed for [%s]\n", __func__, device_config->filename);
+ 	fclose(fp);
+@@ -296,6 +390,12 @@
+     }
+ 
+     fclose(fp);
++    if (data[6]!=1U || data[7]!=70U || data[8]!=0U || data[9]!=0x10U) { free(data); return NULL; }
++    for (unsigned block=0;block<53U;++block) {
++        if (CRCCCITT(data+block*512U,512U,0xffffU)!=expected_crcs[block]) {
++            fprintf(stderr,"Pinned firmware CRC mismatch at file block %u\n",block); free(data); return NULL;
++        }
++    }
+     if (device_config->id == GB2_ID) {
+ 	memcpy(&device_file_version, &data[6], 2);
+ 	printf("[%s] Device File Version %u.%u\n", device_config->filename, data[6], data[7]);
+@@ -380,15 +480,12 @@
+ }
+ 
+ int send_next_block_id(int block, unsigned char *netframe) {
+-    memcpy(netframe, M_BLOCK, 13);
+-    memcpy(&netframe[5], &device_id, 4);
+-    netframe[10] = block;
+-    send_frame(netframe);
+-    memcpy(checkframe_block_id, checkframe, 10);
+-    checkframe_block_id[4] = 6;
+-    checkframe_block_id[9] = 0x44;
+-    checkframe_block_id[10] = block;
+-    return 0;
++    if (last_bin_block<0 || last_bin_block>52 || block!=last_bin_block+2)
++        return recovery_fail("invalid block selector",NULL);
++    recovery_state=REC_WAIT_SELECT; sent_parts=0; block_crc=0;
++    if (set_deadline()!=0) return -1;
++    memcpy(netframe,M_BLOCK,13); memcpy(netframe+5,recovery_uid,4); netframe[10]=(uint8_t)block;
++    return send_frame(netframe);
+ }
+ 
+ int device_setup(char *device, struct update_config *device_config) {
+@@ -413,345 +510,158 @@
+     return ret;
+ }
+ 
+-int send_block(unsigned char *binfile, int length, unsigned char *netframe) {
+-    int i, part = 0;
+-    uint16_t crc;
+-
+-    for (i = 0; i < length; i += 8) {
+-	memcpy(netframe, M_DATA, 5);
+-	netframe[3] = part;
+-	part++;
+-	memcpy(&netframe[5], &binfile[i], 8);
+-	send_frame(netframe);
+-    }
+-    memcpy(netframe, &M_CRC, 10);
+-    memcpy(&netframe[5], &device_id, 4);
+-    crc = htons(CRCCCITT(binfile, length, 0xFFFF));
+-    memcpy(&netframe[10], &crc, 2);
+-    send_frame(netframe);
+-    return 0;
+-}
+-
+-void fsm(unsigned char *netframe, struct update_config *device_config) {
+-    unsigned int canid;
+-    unsigned char next_frame[13];
+-    struct timespec to_wait;
+-
+-    canid = be32(netframe);
+-    switch (canid & 0xFFFF0000UL) {
+-    case (0x00310000UL):
+-	printf("received CAN Ping answer\n");
+-	/* print_can_frame(" ", netframe, 1); */
+-	if ((netframe[4] == 8) && (netframe[5] == device_config->id)) {
+-	    memcpy(&version, &netframe[9], 2);
+-	    if (netframe[5] == GB2_ID)
+-		printf("found Gleisbox with ID 0x%08X  Version %u.%u\n", be32(&netframe[5]), netframe[9], netframe[10]);
+-	    if (netframe[5] == MS2_ID)
+-		printf("found MS2 with ID 0x%08X  Version %u.%u\n", be32(&netframe[5]), netframe[9], netframe[10]);
+-	    if ((version == device_file_version) && (!force)) {
+-		printf("file and device version are the same - use -f to force update\n");
+-		exit(EXIT_FAILURE);
+-	    }
+-	    printf("Start update ...\n");
+-	    memcpy(next_frame, M_RESET, 13);
+-	    memcpy(&device_id, &netframe[5], 4);
+-	    memcpy(&next_frame[5], &device_id, 4);
+-	    send_frame(next_frame);
+-	    /* delay for boot ? */
+-	    to_wait.tv_sec = 0;
+-	    to_wait.tv_nsec = 500 * 1000000;
+-	    nanosleep(&to_wait, NULL);
+-
+-	    memcpy(next_frame, M_INIT_BOOTLOADER, 13);
+-	    send_frame(next_frame);
+-	}
+-	break;
+-    case (0x00370000UL):
+-	/* should always be true */
+-	if (device_id != 0) {
+-	    if ((netframe[4] == 8) && (memcmp(&netframe[5], &device_id, 4) == 0) &&
+-		/* the Gleisbox firmware variety of types seems to be growing ... */
+-		((netframe[12] == 0x10) || (netframe[12] == 0x11) || (netframe[12] == 0x32 ))) {
+-		/* prepare test frame for later use */
+-		memcpy(checkframe, netframe, 10);
+-		memset(&checkframe[10], 0, 3);
+-		checkframe[1] = 0x37;
+-		checkframe[4] = 5;
+-		checkframe[9] = 0x88;
+-		memcpy(checkframe_nack, checkframe, 13);
+-		/* print_can_frame(CECK_FORMAT_STRG, checkframe, 1); */
+-		/* print_can_frame(CECK_FORMAT_STRG, checkframe_nack, 1); */
+-		last_bin_block = dev_bin_blocks;
+-		send_next_block_id(last_bin_block + device_config->boot_blocks, lastframe);
+-	    } else {
+-		/* first data block */
+-		if ((memcmp(&netframe[4], &lastframe[4], 9) == 0) && (last_bin_block == dev_bin_blocks)) {
+-		    if (last_bin_block == dev_bin_blocks) {
+-			printf("sending block 0x%02X 0x%04X\n", last_bin_block + device_config->boot_blocks,
+-			       last_bin_block * device_config->block_size);
+-			send_block(&binfile[((last_bin_block) * device_config->block_size)],
+-				   device_fsize - dev_bin_blocks * device_config->block_size, lastframe);
+-			last_bin_block--;
+-		    }
+-		} else {
+-		    /* there seems to be different NACK types : 0xF1 and 0xF2 */
+-		    if ((memcmp(netframe, checkframe_nack, 9) == 0) && ((netframe[9] == 0xf1) || (netframe[9] == 0xf2))) {
+-			print_can_frame(CECK_FORMAT_STRG, netframe, 1);
+-			fprintf(stderr, "Aiiee got NACK ! Aborting ...\n\n");
+-			finished = -1;
+-		    }
+-		    /* MS2 may use 0x0000 as hash -> begin compare at data length field */
+-		    if (memcmp(&netframe[4], &checkframe_block_id[4], 7) == 0) {
+-			printf("sending block 0x%02X 0x%04X\n", last_bin_block + device_config->boot_blocks,
+-			       last_bin_block * device_config->block_size);
+-			send_block(&binfile[((last_bin_block) * device_config->block_size)], device_config->block_size,
+-				   lastframe);
+-			last_bin_block--;
+-		    }
+-		    /* MS2 may use 0x0000 as hash -> begin compare at data length field */
+-		    if (memcmp(&netframe[4], &checkframe[4], 6) == 0) {
+-			if (last_bin_block >= 0) {
+-			    send_next_block_id(last_bin_block + device_config->boot_blocks, lastframe);
+-			} else {
+-			    if (device_config->id == MS2_ID) {
+-				send_frame(M_MS2_MARK_END);
+-				to_wait.tv_sec = 0;
+-				to_wait.tv_nsec = 2 * 1000000;
+-				nanosleep(&to_wait, NULL);
+-				send_frame(M_MS2_SOFT_RESET);
+-			    }
+-			    finished = 1;
+-			}
+-		    }
+-		}
+-	    }
+-	}
+-	break;
+-    default:
+-	break;
++int send_block(unsigned char *bytes, int length, unsigned char *netframe) {
++    if (recovery_state!=REC_WAIT_SELECT || length!=512 || last_bin_block<0 || last_bin_block>52 ||
++        bytes!=binfile+(unsigned)last_bin_block*512U)
++        return recovery_fail("data without matching selector ACK",NULL);
++    recovery_state=REC_SENDING;
++    if (set_deadline()!=0) return -1;
++    block_crc=CRCCCITT(bytes,512U,0xffffU);
++    for (int i=0;i<length;i+=8) {
++        if (check_deadline()!=0) return -1;
++        memcpy(netframe,M_DATA,13); netframe[3]=(uint8_t)sent_parts;
++        memcpy(netframe+5,bytes+i,8);
++        if (send_frame(netframe)!=0) return -1;
++        ++sent_parts;
++    }
++    if (check_deadline()!=0) return -1;
++    memcpy(netframe,M_CRC,13); memcpy(netframe+5,recovery_uid,4);
++    netframe[10]=(uint8_t)(block_crc>>8); netframe[11]=(uint8_t)block_crc;
++    if (send_frame(netframe)!=0) return -1;
++    recovery_state=REC_WAIT_CRC;
++    return set_deadline();
++}
++
++void fsm(unsigned char *frame, struct update_config *config) {
++    uint32_t command=be32(frame)&0x1fff0000U;
++    unsigned hash=be32(frame)&0xffffU;
++    if (!execute_recovery || recovery_state==REC_DONE || recovery_state==REC_ABORT) return;
++    if (check_deadline()!=0) return;
++    if (frame[4]>8U) { (void)recovery_fail("invalid DLC",frame); return; }
++    if (command!=0x00310000U && command!=0x00370000U) return;
++    if (frame[4]<4U || memcmp(frame+5,recovery_uid,4)!=0) return;
++    /* A normal ping NEVER resets or reinitializes this boot-only attempt. */
++    if (command==0x00310000U) return;
++    if (frame[4]>=5U && frame[9]>=0xf1U && frame[9]<=0xf6U) {
++        (void)recovery_fail("target bootloader NACK; no retry",frame); return;
++    }
++    if (have_boot_hash && hash!=boot_hash) {
++        (void)recovery_fail("target bootloader hash changed",frame); return;
++    }
++    if (frame[4]==8U) {
++        if (frame[11]!=0U || frame[12]!=0x10U) {
++            (void)recovery_fail("target bootloader type must be0010",frame); return;
++        }
++        if (recovery_state!=REC_WAIT_BOOT) return; /* Duplicate identity: no restart. */
++        boot_hash=(uint16_t)hash; have_boot_hash=1;
++        fprintf(recovery_log ? recovery_log : stderr,"Start recovery transfer UID47000001 boot_hash=%04X version=%u.%u blocks=0x36..0x02\n",
++            hash,(unsigned)frame[9],(unsigned)frame[10]);
++        { struct timespec delay={0,500000000L};
++          while (nanosleep(&delay,&delay)!=0) {
++              if (errno!=EINTR || interrupted) { (void)recovery_fail("boot readiness wait interrupted",NULL); return; }
++          }
++        }
++        if (check_deadline()!=0) return;
++        (void)send_next_block_id(last_bin_block+(int)config->boot_blocks,lastframe);
++        return;
++    }
++    if (recovery_state==REC_WAIT_SELECT && frame[4]==6U && frame[9]==0x44U) {
++        if (frame[10]!=last_bin_block+2) { (void)recovery_fail("selector ACK for wrong block",frame); return; }
++        fprintf(recovery_log ? recovery_log : stderr,"Send block=0x%02X offset=0x%04X length=512\n",last_bin_block+2,(unsigned)last_bin_block*512U);
++        (void)send_block(binfile+(unsigned)last_bin_block*512U,512,lastframe);
++        return;
++    }
++    if (recovery_state==REC_WAIT_CRC && frame[4]==5U && frame[9]==0x88U && sent_parts==64U) {
++        ++acknowledged_blocks; --last_bin_block;
++        if (last_bin_block>=0) (void)send_next_block_id(last_bin_block+2,lastframe);
++        else { recovery_state=REC_DONE; finished=1; }
++        return;
+     }
++    (void)recovery_fail("unexpected/premature/duplicate ACK",frame);
+ }
+ 
+ int main(int argc, char **argv) {
+-    int ret, s, opt;
+-    struct can_frame frame;
+-    struct timeval timeout;
+-    int local_port, destination_port;
+-    int on, sa;			/* UDP socket */
+-    struct sockaddr_in saddr, baddr;
+-    struct sockaddr_can caddr;
+-    struct ifreq ifr;
+-    struct update_config device_config;
+-    char broadcast_address[16];
+-    socklen_t caddrlen;
+-    fd_set readfds;
+-
+-    /* wait for response */
+-    timeout.tv_sec = TIMEOUT;
+-    timeout.tv_usec = 0;
+-
+-    /* socklen_t sin_size = sizeof(clientaddr); */
+-    caddrlen = sizeof(caddr);
+-
+-    if (device_setup(basename(argv[0]), &device_config) < 0) {
+-	fprintf(stderr, "invalid device\n");
+-	exit(EXIT_FAILURE);
+-    }
+-
+-    local_port = 15731;
+-    destination_port = 15730;
+-    on = 1;
+-    strcpy(broadcast_address, "255.255.255.255");
+-
+-    memset(&saddr, 0, sizeof(saddr));
+-    memset(&baddr, 0, sizeof(baddr));
+-    memset(&caddr, 0, sizeof(caddr));
+-    memset(&frame, 0, sizeof(frame));
+-    memset(udpframe, 0, sizeof(udpframe));
+-
+-    /* prepare udp destination struct with defaults */
+-    baddr.sin_family = AF_INET;
+-    baddr.sin_port = htons(destination_port);
+-    s = inet_pton(AF_INET, broadcast_address, &baddr.sin_addr);
+-    if (s <= 0) {
+-	if (s == 0) {
+-	    fprintf(stderr, "UDP IP invalid\n");
+-	} else {
+-	    fprintf(stderr, "invalid address family\n");
+-	}
+-	exit(EXIT_FAILURE);
+-    }
+-
+-    while ((opt = getopt(argc, argv, "d:l:b:i:fpvh?")) != -1) {
+-	switch (opt) {
+-	case 'l':
+-	    local_port = strtoul(optarg, (char **)NULL, 10);
+-	    break;
+-	case 'd':
+-	    destination_port = strtoul(optarg, (char **)NULL, 10);
+-	    baddr.sin_port = htons(destination_port);
+-	    break;
+-	case 'b':
+-	    s = inet_pton(AF_INET, optarg, &baddr.sin_addr);
+-	    if (s <= 0) {
+-		if (s == 0) {
+-		    fprintf(stderr, "invalid IP address: %s\n", strerror(errno));
+-		} else {
+-		    fprintf(stderr, "inet_pton error: %s\n", strerror(errno));
+-		}
+-		exit(EXIT_FAILURE);
+-	    }
+-	    break;
+-	case 'i':
+-	    strncpy(ifr.ifr_name, optarg, sizeof(ifr.ifr_name) - 1);
+-	    can_mode = 1;
+-	    break;
+-	case 'f':
+-	    force = 1;
+-	    break;
+-	case 'p':
+-	    print_version = 1;
+-	    break;
+-	case 'v':
+-	    verbose = 1;
+-	    break;
+-	case 'h':
+-	case '?':
+-	    print_usage(basename(argv[0]));
+-	    exit(EXIT_SUCCESS);
+-	default:
+-	    fprintf(stderr, "Unknown option %c\n", opt);
+-	    print_usage(basename(argv[0]));
+-	    exit(EXIT_FAILURE);
+-	}
+-    }
+-    if (optind < argc) {
+-	device_config.filename = argv[optind];
+-    }
+-
+-    if ((verbose) | print_version)
+-	print_versions(&device_config);
+-    /* we wanted only the file information - exit */
+-    if (print_version)
+-	exit(EXIT_SUCCESS);
+-
+-    binfile = read_data(&device_config);
+-    if (binfile == NULL)
+-	exit(EXIT_FAILURE);
+-    dev_bin_blocks = (device_fsize - 1) >> device_config.shift;
+-    /* printf("%s: fsize 0x%04X device_fsize 0x%04X blocks 0x%02X last 0x%04X\n", device_config.filename,
+-	   fsize, device_fsize, dev_bin_blocks, device_fsize - dev_bin_blocks * device_config.block_size); */
+-
+-    if (can_mode) {
+-	if ((sc = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
+-	    fprintf(stderr, "CAN socket error: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-
+-	caddr.can_family = AF_CAN;
+-	if (ioctl(sc, SIOCGIFINDEX, &ifr) < 0) {
+-	    fprintf(stderr, "CAN setup error: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-	caddr.can_ifindex = ifr.ifr_ifindex;
+-
+-	if (bind(sc, (struct sockaddr *)&caddr, caddrlen) < 0) {
+-	    fprintf(stderr, "CAN bind error: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-	/* start Maerklin 60113 box */
+-	if (netframe_to_can(sc, M_GLEISBOX_MAGIC_START_SEQUENCE) < 0) {
+-	    fprintf(stderr, "can't send CAN magic 60113 start sequence: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-	/* send CAN Ping */
+-	if (netframe_to_can(sc, M_CAN_PING) < 0) {
+-	    fprintf(stderr, "can't send CAN Ping: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-	sa = 0;
+-	sb = 0;
+-
+-    } else {
+-	if ((sa = socket(PF_INET, SOCK_DGRAM, 0)) < 0) {
+-	    fprintf(stderr, "UDP socket error: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-
+-	saddr.sin_family = AF_INET;
+-	saddr.sin_addr.s_addr = htonl(INADDR_ANY);
+-	saddr.sin_port = htons(local_port);
+-
+-	if (bind(sa, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+-	    fprintf(stderr, "UDP bind error: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-	/* prepare UDP sending socket */
+-	if ((sb = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+-	    fprintf(stderr, "UDP sending socket error %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-	if (setsockopt(sb, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on)) < 0) {
+-	    fprintf(stderr, "UDP set socket option error: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-	sc = 0;
+-	/* send CAN Ping */
+-	if (netframe_to_net(sb, M_CAN_PING, 13) < 0) {
+-	    fprintf(stderr, "can't send CAN Ping: %s\n", strerror(errno));
+-	    exit(EXIT_FAILURE);
+-	}
+-    }
+-
+-    while (1) {
+-	FD_ZERO(&readfds);
+-	FD_SET(sc, &readfds);
+-	FD_SET(sa, &readfds);
+-
+-	ret = select((sc > sa) ? sc + 1 : sa + 1, &readfds, NULL, NULL, &timeout);
+-	/* reset timer */
+-	timeout.tv_sec = TIMEOUT;
+-	timeout.tv_usec = 0;
+-
+-	if (ret == 0) {
+-	    fprintf(stderr, "no response for %d seconds - terminating\n", TIMEOUT);
+-	    exit(EXIT_FAILURE);
+-	}
+-
+-	if (ret < 0)
+-	    fprintf(stderr, "select error: %s\n", strerror(errno));
+-
+-	/* received a CAN frame */
+-	if (FD_ISSET(sc, &readfds)) {
+-
+-	    if (read(sc, &frame, sizeof(struct can_frame)) < 0) {
+-		fprintf(stderr, "CAN read error: %s\n", strerror(errno));
+-		exit(EXIT_FAILURE);
+-	    } else if (frame.can_id & CAN_EFF_FLAG) {	/* only EFF frames are valid */
+-		format_can_to_netframe(&frame, netframe);
+-		fsm(netframe, &device_config);
+-		if (finished == 1)
+-		    break;
+-		if (finished < 0)
+-		    exit(EXIT_FAILURE);
+-	    }
+-	}
+-	/* received a UDP packet */
+-	if (FD_ISSET(sa, &readfds)) {
+-	    if (read(sa, udpframe, MAXDG) == 13) {
+-		fsm(udpframe, &device_config);
+-		if (finished == 1)
+-		    break;
+-		if (finished < 0)
+-		    exit(EXIT_FAILURE);
+-	    }
+-	}
+-    }
+-    printf("Update successfull !\n\n");
+-    free(binfile);
+-    close(sc);
+-    close(sa);
+-    close(sb);
+-    return 0;
++    struct update_config config;
++    struct sockaddr_can address;
++    struct ifreq interface;
++    struct can_filter filters[2]={{CAN_EFF_FLAG|0x00310000U,0xdfff0000U},{CAN_EFF_FLAG|0x00370000U,0xdfff0000U}};
++    can_err_mask_t errors=CAN_ERR_MASK;
++    const char *interface_name=NULL;
++    int opt,zero=0,exit_status=1;
++    static const struct option options[]={
++        {"interface",required_argument,NULL,'i'}, {"bootloader",no_argument,NULL,'B'},
++        {"execute",no_argument,NULL,'x'}, {"help",no_argument,NULL,'h'}, {NULL,0,NULL,0}
++    };
++    (void)device_setup("gb2",&config); /* No basename-selected MS2 mode. */
++    while ((opt=getopt_long(argc,argv,"i:Bxpvh",options,NULL))!=-1) {
++        switch (opt) {
++        case 'i': interface_name=optarg; break;
++        case 'B': bootloader_only=1; break;
++        case 'x': execute_recovery=1; break;
++        case 'p': print_version=1; break;
++        case 'v': verbose=1; break;
++        case 'h': print_usage(argv[0]); return 0;
++        default: print_usage(argv[0]); return 2;
++        }
++    }
++    if (optind<argc) config.filename=argv[optind++];
++    if (optind!=argc || (execute_recovery && (!bootloader_only || interface_name==NULL))) {
++        print_usage(argv[0]); return 2;
++    }
++    binfile=read_data(&config);
++    if (binfile==NULL) return 1;
++    dev_bin_blocks=(int)((device_fsize-1U)>>config.shift);
++    printf("UID47000001 only: bytes=%u padded=%u blocks=53 wire=0x36..0x02 CRC16/CCITT seedFFFF paddingFF\n",fsize,device_fsize);
++    if (!execute_recovery || print_version) {
++        printf("DRY-RUN: no CAN socket, no query, no reset or flash. Activation requires --execute --bootloader -i can0.\n");
++        free(binfile); binfile=NULL; return 0;
++    }
++    if (strlen(interface_name)>=sizeof(interface.ifr_name)) { free(binfile); return 2; }
++    memset(&interface,0,sizeof(interface)); strcpy(interface.ifr_name,interface_name);
++    memset(&address,0,sizeof(address));
++    if (signal(SIGINT,recovery_interrupt)==SIG_ERR || signal(SIGTERM,recovery_interrupt)==SIG_ERR) { free(binfile); return 1; }
++    can_mode=1;
++    sc=socket(PF_CAN,SOCK_RAW|SOCK_NONBLOCK|SOCK_CLOEXEC,CAN_RAW);
++    if (sc<0) { perror("CAN socket"); free(binfile); return 1; }
++    if (ioctl(sc,SIOCGIFINDEX,&interface)<0 ||
++        setsockopt(sc,SOL_CAN_RAW,CAN_RAW_RECV_OWN_MSGS,&zero,sizeof(zero))!=0 ||
++        setsockopt(sc,SOL_CAN_RAW,CAN_RAW_FILTER,filters,sizeof(filters))!=0 ||
++        setsockopt(sc,SOL_CAN_RAW,CAN_RAW_ERR_FILTER,&errors,sizeof(errors))!=0) {
++        perror("CAN setup"); goto done;
++    }
++    address.can_family=AF_CAN; address.can_ifindex=interface.ifr_ifindex;
++    if (bind(sc,(struct sockaddr *)&address,sizeof(address))!=0) { perror("CAN bind"); goto done; }
++    /* No magic-start11 and no normal ping/reset. Query existing bootloader once. */
++    if (begin_bootloader_recovery()!=0) goto done;
++    while (!finished) {
++        struct timeval timeout;
++        struct can_frame frame;
++        fd_set readers;
++        uint64_t remaining;
++        ssize_t count;
++        int ready;
++        if (check_deadline()!=0) break;
++        remaining=phase_deadline-recovery_now();
++        if (remaining>5000U) { (void)recovery_fail("clock/deadline changed",NULL); break; }
++        timeout.tv_sec=(time_t)(remaining/1000U); timeout.tv_usec=(suseconds_t)((remaining%1000U)*1000U);
++        FD_ZERO(&readers); FD_SET(sc,&readers);
++        ready=select(sc+1,&readers,NULL,NULL,&timeout);
++        if (check_deadline()!=0) break;
++        if (ready<0) { if (errno==EINTR) continue; (void)recovery_fail("CAN wait failed",NULL); break; }
++        if (ready==0) continue;
++        count=read(sc,&frame,sizeof(frame));
++        if (count<0 && (errno==EAGAIN || errno==EINTR)) continue;
++        if (count!=(ssize_t)sizeof(frame) || frame.can_dlc>8U || (frame.can_id&CAN_ERR_FLAG)) {
++            (void)recovery_fail("CAN read/error frame",NULL); break;
++        }
++        if (!(frame.can_id&CAN_EFF_FLAG) || (frame.can_id&CAN_RTR_FLAG)) continue;
++        format_can_to_netframe(&frame,netframe); fsm(netframe,&config);
++    }
++    if (finished==1) {
++        printf("All53 blocks acknowledged; no reset/start sent. Application1.70/flash commit NOT independently verified.\n");
++        exit_status=0;
++    }
++ done:
++    close(sc); free(binfile); binfile=NULL;
++    return exit_status;
+ }
+-

@@ -1,0 +1,7 @@
+PUBLICATION COPY; local input/toolchain paths redacted.
+mkdir -p build/omega2
+<TOOLCHAIN>/bin/mipsel-openwrt-linux-gcc -Os -g -std=c11 -Wall -Wextra -Werror -EL -mabi=32 -mips32r2 -mtune=24kc -msoft-float -mno-mips16 -mno-micromips -ffunction-sections -fdata-sections src/gb2-recovery.c -static -Wl,--gc-sections -Wl,--build-id=none -Wl,-z,noexecstack -o build/omega2/gb2-recovery
+mipsel-openwrt-linux-musl-gcc.bin: warning: environment variable 'STAGING_DIR' not defined
+mipsel-openwrt-linux-musl-gcc.bin: warning: environment variable 'STAGING_DIR' not defined
+mipsel-openwrt-linux-musl-gcc.bin: warning: environment variable 'STAGING_DIR' not defined
+<TOOLCHAIN>/bin/mipsel-openwrt-linux-strip --strip-all -o build/omega2/gb2-recovery.stripped build/omega2/gb2-recovery

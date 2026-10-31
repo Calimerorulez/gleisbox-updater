@@ -1,0 +1,20 @@
+PUBLICATION COPY; local input/toolchain paths redacted.
+clang -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -std=c11 -Wall -Wextra -Werror tests/test_recovery.c -Wl,--wrap=write -Wl,--wrap=socket -Wl,--wrap=send -Wl,--wrap=clock_gettime -Wl,--wrap=nanosleep -o build/test-recovery-sanitize
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./build/test-recovery-sanitize "<LOCAL_FIRMWARE>/016-gb2.bin"
+Usage: gb2-recovery [-i can0] [--bootloader] [--execute] [016-gb2.bin]
+Fixed recovery target UID47000001; type0010 bootloader, type0011 application.
+Default: validate the pinned file and print the plan; ZERO sockets/writes.
+--execute REQUIRES --bootloader and -i; one query, no reset/start/retries.
+netframe_to_can: error writing CAN frame: Input/output error
+Pinned firmware CRC mismatch at file block 0
+[<LOCAL_FIRMWARE>/016-gb2.bin] Device File Version 1.70
+UID47000001 only: bytes=27063 padded=27136 blocks=53 wire=0x36..0x02 CRC16/CCITT seedFFFF paddingFF
+DRY-RUN: no CAN socket, no query, no reset or flash. Activation requires --execute --bootloader -i can0.
+[<LOCAL_FIRMWARE>/016-gb2.bin] Device File Version 1.70
+Synthetic F2 reproduction:
+Start recovery transfer UID47000001 boot_hash=1234 version=1.47 blocks=0x36..0x02
+Send block=0x36 offset=0x6800 length=512
+Send block=0x35 offset=0x6600 length=512
+RECOVERY ABORT: target bootloader NACK; no retry state=WAIT_CRC block=0x35 file_index=51 offset=0x6600 parts=64/64 crc=6A89 acknowledged=1/53
+RX 00371234#47000001F2 dlc=5 wire=003712340547000001F2000000
+GB2 recovery offline: 27047 checks passed; double-ping/F2, 53 blocks/CRC, timeouts, ordering, I/O, interruption, corrupt file; ZERO sockets

@@ -1,0 +1,56 @@
+{
+  "verified_on": "2026-10-31",
+  "publication": "source, patch, tests, documentation and reviewed text evidence only",
+  "upstream": {
+    "repository": "GBert/railroad",
+    "commit": "a427e6528922e7f17e4eebfb9c9af68599bb2268",
+    "path": "can2udp/src/gb2-update.c",
+    "sha256": "5b0568e95555391eaf2927d5c08f56b3c8e1109099511ce495cb70de643d8377",
+    "exact_match_with_pinned_upstream": true,
+    "license": "Beer-Ware Revision 42; notice retained"
+  },
+  "offline_checks": {
+    "historical_native": 27047,
+    "historical_asan_ubsan": 27047,
+    "original_source_rerun_native": 27047,
+    "original_source_rerun_asan_ubsan": 27047,
+    "publication_copy_native": 27047,
+    "publication_copy_asan_ubsan": 27047,
+    "sockets_opened": 0,
+    "hardware_accessed": false,
+    "leak_sanitizer_enabled": false,
+    "f2_frame_is_synthetic": true
+  },
+  "original_stripped_binary": {
+    "bytes": 66732,
+    "sha256": "69af522875a35b118a2869affac1fae8f04825461be23dba89cefec5c317a811",
+    "toolchain": "OpenWrt 25.12.1, GCC 14.3.0, musl, mipsel_24kc",
+    "byte_identical_local_rebuild": true,
+    "unstripped_build_identical": false,
+    "historical_hardware_execution_of_this_exact_hash_proven": false,
+    "published": false
+  },
+  "hardware_result": {
+    "firmware": "1.70",
+    "confirmation": "owner confirmation, reaffirmed 2026-10-31",
+    "original_execution_log_found": false,
+    "exact_execution_date_known": false,
+    "new_hardware_test_performed": false,
+    "publication_copy_hardware_tested": false
+  },
+  "publication_checks": {
+    "regenerated_patch_applies_exactly": true,
+    "recovery_code_changes_limited_to_anonymisation_and_comment": true,
+    "real_device_uids_removed": true,
+    "synthetic_target_uid": "47000001",
+    "firmware_images_published": false,
+    "binaries_published": false,
+    "private_workspace_files_hashed_unchanged": 4766,
+    "ms2_git_history_imported": false
+  },
+  "search_limits": {
+    "scope": "one bounded local pass through relevant home/temp files, backup archives, logs, old builds and available related reflogs",
+    "original_workspace_git_metadata": "empty metadata directory, no usable reflog",
+    "other_related_reflogs": "no Gleisbox execution evidence found"
+  }
+}

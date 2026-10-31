@@ -1,0 +1,10 @@
+/build/
+*.bin
+*.ms2
+*.elf
+*.o
+*.pcap
+*.pcapng
+*.candump
+.env
+.env.*
